@@ -4,6 +4,7 @@
 #include "stdlib.h"
 #include "led.h"
 #include "rtc.h"
+#include "adc.h"
 #include "mht11.h"
 #include "tft.h"
 #include "key.h"
@@ -49,8 +50,17 @@ volatile uint8_t  key_int_flag           = 0;
 volatile uint8_t  g_rtc_refresh_flag     = 0;
 volatile uint32_t g_key_last_tick        = 0;
 volatile uint32_t step_count              = 0;
-volatile uint32_t ulCount                = 0;
+volatile uint32_t ulIdleCount                = 0;
 volatile uint8_t  g_alarm_int_trig       = 0; // 闹钟中断标志(中断专用)
+
+volatile uint16_t g_adc_light_val = 0;       // 当前ADC亮度均值
+volatile uint32_t g_dark_start_tick = 0;     // 进入暗光起始滴答
+volatile uint8_t  g_screen_off_flag = 0;     // 屏幕是否已熄屏标记
+volatile uint8_t  g_alarm_light_on = 0; // 闹钟亮屏标记，亮屏时禁止熄屏
+
+#define ADC_LIGHT_DARK_THRESHOLD    80    // ADC8bit，低于该值判定遮挡/暗光
+#define ADC_DARK_DELAY_TICK         pdMS_TO_TICKS(1500) // 持续暗光1.5s熄屏
+#define AUTO_OFF_TIMER_SEC          30    // 无操作30s熄屏
 
 #define KEY_FILTER_TICK pdMS_TO_TICKS(300)
 #define MAX_ALARM_NUM   5
@@ -100,6 +110,7 @@ static TaskHandle_t app_task_usart_handle    = NULL;
 static TaskHandle_t app_task_wire_handle     = NULL;
 static TaskHandle_t app_task_camera_handle     = NULL;
 static TaskHandle_t app_task_face_handle    = NULL;
+static TaskHandle_t app_task_adc_handle      = NULL;
 
 TimerHandle_t soft_timer_handle = NULL;
 
@@ -119,6 +130,8 @@ static void app_task_usart(void* pvParameters);
 static void app_task_wire(void* pvParameters);
 static void app_task_camera(void* pvParameters);
 static void app_task_face(void* pvParameters);
+static void app_task_adc(void* pvParameters);
+
 static void vTimer_callback(TimerHandle_t pxTimer);
 
 // 串口接收结构体
@@ -207,6 +220,7 @@ static void app_task_start(void* pvParameters)
 	key_init();
 	max30102_init();
 	MPU_Init();
+	adc_init();
 	
     TFT_init();
     tp_init();
@@ -226,6 +240,8 @@ static void app_task_start(void* pvParameters)
 	// 1s周期软件定时器：熄屏计时
 	soft_timer_handle = xTimerCreate( "timer", pdMS_TO_TICKS(1000), pdTRUE, (void *)1, vTimer_callback );
 	xTimerStart(soft_timer_handle, 0);	
+	
+	xTaskCreate(app_task_adc,   "adc_light", 512, NULL, 5, &app_task_adc_handle);
 	
 //	xTaskCreate(app_task_mpu6050, "mpu",512,NULL,5,&app_task_mpu6050_handle);
 	
@@ -317,12 +333,13 @@ static void app_task_rtc(void* pvParameters)
 
         // 1. 硬件闹钟中断触发
         if(g_alarm_int_trig)
-        {
-            g_alarm_int_trig = 0;
-            Led_Alarm_On();
-            alarm_trig_lock = 1;
-            alarm_light_tick = xTaskGetTickCount();
-        }
+		{
+			g_alarm_int_trig = 0;
+			Led_Alarm_On();
+			alarm_trig_lock = 1;
+			g_alarm_light_on = 1; // 标记闹钟亮屏
+			alarm_light_tick = xTaskGetTickCount();
+		}
 
         // 2. 软件轮询兜底校验（十进制对比，修复卡死根源）
         for(uint8_t i=0; i<g_alarm_count; i++)
@@ -336,18 +353,20 @@ static void app_task_rtc(void* pvParameters)
             }
         }
         if(hit_alarm && alarm_trig_lock == 0)
-        {
-            Led_Alarm_On();
-            alarm_trig_lock = 1;
-            alarm_light_tick = xTaskGetTickCount();
-        }
+		{
+			Led_Alarm_On();
+			alarm_trig_lock = 1;
+			g_alarm_light_on = 1;
+			alarm_light_tick = xTaskGetTickCount();
+		}
 
         // 3. 亮灯30s自动熄灭
-        if(alarm_trig_lock && (xTaskGetTickCount() - alarm_light_tick) > pdMS_TO_TICKS(30000))
-        {
-            Led_Alarm_Off();
-            alarm_trig_lock = 0;
-        }
+		if(alarm_trig_lock && (xTaskGetTickCount() - alarm_light_tick) > pdMS_TO_TICKS(30000))
+		{
+			Led_Alarm_Off();
+			alarm_trig_lock = 0;
+			g_alarm_light_on = 0; // 取消闹钟标记
+		}
 
         // 每分钟解锁闹钟触发锁
         if(BcdToDec(last_m) != cur_m_dec)
@@ -564,6 +583,14 @@ static void app_task_tp(void* pvParameters)
 		{
 			if(tp_sta != 0)
 			{
+                // 新增：触摸立刻亮屏，清除暗光标记
+				if(g_screen_off_flag == 1)
+				{
+					LCD_SAFE(lcd_display_on(1););
+					g_screen_off_flag = 0;
+					g_dark_start_tick = 0;
+					ulIdleCount = 0; // 重置30s计时器
+				}
 				Led_Alarm_Off(); // 任意触摸熄灭闹钟LED
 				if(press_flag == 0)
 				{
@@ -595,6 +622,14 @@ static void app_task_tp(void* pvParameters)
 		{
 			if(tp_sta != 0)
 			{
+                // 新增：触摸立刻亮屏
+				if(g_screen_off_flag == 1)
+				{
+					LCD_SAFE(lcd_display_on(1););
+					g_screen_off_flag = 0;
+					g_dark_start_tick = 0;
+					ulIdleCount = 0;
+				}
 				Led_Alarm_Off();
 				if(press_flag == 0)
 				{
@@ -986,13 +1021,23 @@ static void app_task_face(void* pvParameters)
 
 /* ================= 软件定时器：熄屏计时 ================= */
 static void vTimer_callback(TimerHandle_t pxTimer)
-{		
-	ulCount++;
-	if(ulCount>=30)
-	{
-		LCD_SAFE(lcd_display_on(0););
-		ulCount=0;
-	}
+{
+    // 闹钟亮屏时禁止熄屏
+    if (g_alarm_light_on)
+    {
+        ulIdleCount = 0;
+        return;
+    }
+
+    ulIdleCount++;
+
+    if (ulIdleCount >= AUTO_OFF_TIMER_SEC)
+    {
+        LCD_SAFE(lcd_display_on(0));
+        g_screen_off_flag = 1;   // ? 标记已熄屏
+        ulIdleCount = 0;
+        g_dark_start_tick = 0;
+    }
 }
 
 /* ================= MPU6050抬手亮屏（删除冲突IO操作） ================= */
@@ -1099,6 +1144,51 @@ static void app_task_usart(void* pvParameters)
 		vTaskDelay(pdMS_TO_TICKS(50));
 	} 
 } 
+
+/* ================= ADC光敏亮度采集任务：遮挡/暗光自动息屏 ================= */
+static void app_task_adc(void* pvParameters)
+{
+    uint16_t adc_val;
+    uint32_t now_tick;
+
+    for(;;)
+    {
+        if (g_alarm_light_on == 1)
+        {
+            g_dark_start_tick = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        adc_val = adc_median_average_filter();
+        g_adc_light_val = adc_val;
+        now_tick = xTaskGetTickCount();
+
+        // 光线充足
+        if (adc_val < ADC_LIGHT_DARK_THRESHOLD)
+        {
+            g_dark_start_tick = 0;
+        }
+        // 暗光 / 遮挡
+        else
+        {
+            if (g_dark_start_tick == 0)
+            {
+                g_dark_start_tick = now_tick;
+            }
+
+            // ? 只在屏幕还亮着的时候才允许熄屏
+            if ((now_tick - g_dark_start_tick) >= ADC_DARK_DELAY_TICK &&
+                g_screen_off_flag == 0)
+            {
+                LCD_SAFE(lcd_display_on(0));
+                g_screen_off_flag = 1;   // ? 只在这里置位
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
 
 /* ================= FreeRTOS 异常钩子 ================= */
 void vApplicationMallocFailedHook(void)

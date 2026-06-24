@@ -55,6 +55,7 @@
 ..\obj\main.o: D:\keil\ARM\ARMCC\Bin\..\include\stdlib.h
 ..\obj\main.o: ..\HARDWARE\LED\led.h
 ..\obj\main.o: ..\HARDWARE\rtc\rtc.h
+..\obj\main.o: ..\HARDWARE\adc\adc.h
 ..\obj\main.o: ..\HARDWARE\mht11\mht11.h
 ..\obj\main.o: ..\HARDWARE\tft\tft.h
 ..\obj\main.o: ..\FONT\FontDotMatrix16.h

@@ -3,6 +3,6 @@
 
 #include "sys.h"
 
-void key_init(void);
+void adc_init(void);
 
 #endif

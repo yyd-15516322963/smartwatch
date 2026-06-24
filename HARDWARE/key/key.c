@@ -96,7 +96,8 @@ void EXTI3_IRQHandler(void)
 		EXTI_ClearITPendingBit(EXTI_Line3);
 	}
 }
-extern volatile uint32_t ulCount;
+extern volatile uint32_t ulIdleCount;
+extern volatile uint8_t  g_screen_off_flag;
 
 void EXTI4_IRQHandler(void)
 {
@@ -106,7 +107,8 @@ void EXTI4_IRQHandler(void)
 
         if ((now - g_key_tick) >= pdMS_TO_TICKS(KEY_DELAY_MS))
         {
-            ulCount = 0;          // 重置熄屏计时
+            ulIdleCount = 0;          // 重置熄屏计时
+			g_screen_off_flag = 0;         // ? 关键！允许下一次遮挡息屏
             lcd_display_on(1);    // 点亮屏幕
             g_key_tick = now;
         }
