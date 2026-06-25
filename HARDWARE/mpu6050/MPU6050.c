@@ -40,7 +40,7 @@ u8 MPU_Set_Gyro_Fsr(u8 fsr)
 //设置MPU6050加速度传感器满量程范围
 //fsr:0,±2g;1,±4g;2,±8g;3,±16g
 //返回值:0,设置成功
-//    其他,设置失败 
+//    其他,设置失败
 u8 MPU_Set_Accel_Fsr(u8 fsr)
 {
 	return MPU_Write_Byte(MPU_ACCEL_CFG_REG,fsr<<3);//设置加速度传感器满量程范围  
@@ -48,7 +48,7 @@ u8 MPU_Set_Accel_Fsr(u8 fsr)
 //设置MPU6050的数字低通滤波器
 //lpf:数字低通滤波频率(Hz)
 //返回值:0,设置成功
-//    其他,设置失败 
+//    其他,设置失败
 u8 MPU_Set_LPF(u16 lpf)
 {
 	u8 data=0;
