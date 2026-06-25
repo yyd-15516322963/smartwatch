@@ -65,6 +65,7 @@
 "..\obj\warning.o"
 "..\obj\wifi.o"
 "..\obj\blueos.o"
+"..\obj\pic2.o"
 --strict --scatter "..\OBJ\demo.sct"
 --summary_stderr --info summarysizes --map --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers

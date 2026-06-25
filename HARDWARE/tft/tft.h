@@ -31,6 +31,7 @@
 #define GREY	0x7BEF		//»ÒÉ«
 
 
+
 #if LCD_SOFT_SPI_ENABLE
 
 #define SPI_CS_0 PGout(6) = 0

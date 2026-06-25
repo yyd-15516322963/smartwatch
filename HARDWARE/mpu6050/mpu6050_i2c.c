@@ -19,6 +19,7 @@ void IIC_Init(void)
 	GPIO_Init(GPIOB, &GPIO_InitStructure);//初始化
 	IIC_SCL=1;
 	IIC_SDA=1;
+	
 }
 //产生IIC起始信号
 void IIC_Start(void)

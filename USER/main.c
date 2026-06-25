@@ -58,12 +58,14 @@ volatile uint32_t g_dark_start_tick = 0;     // 进入暗光起始滴答
 volatile uint8_t  g_screen_off_flag = 0;     // 屏幕是否已熄屏标记
 volatile uint8_t  g_alarm_light_on = 0; // 闹钟亮屏标记，亮屏时禁止熄屏
 
+volatile uint8_t g_rtc_force_full_refresh = 0;
+
 #define ADC_LIGHT_DARK_THRESHOLD    80    // ADC8bit，低于该值判定遮挡/暗光
 #define ADC_DARK_DELAY_TICK         pdMS_TO_TICKS(1500) // 持续暗光1.5s熄屏
 #define AUTO_OFF_TIMER_SEC          30    // 无操作30s熄屏
 
 #define KEY_FILTER_TICK pdMS_TO_TICKS(300)
-#define MAX_ALARM_NUM   5
+#define MAX_ALARM_NUM   4
 
 // 闹钟结构体(十进制时分秒)
 typedef struct
@@ -220,6 +222,8 @@ static void app_task_start(void* pvParameters)
 	key_init();
 	max30102_init();
 	MPU_Init();
+	mpu_dmp_init();
+    dmp_set_pedometer_step_count(0);
 	adc_init();
 	
     TFT_init();
@@ -227,9 +231,9 @@ static void app_task_start(void* pvParameters)
     TFT_clear(WHITE);
 
     lcd_draw_image(20,25,
-        g_image_tbl[18].width,
-        g_image_tbl[18].height,
-        g_image_tbl[18].address);
+        g_image_tbl[11].width,
+        g_image_tbl[11].height,
+        g_image_tbl[11].address);
 	
 	vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -243,7 +247,7 @@ static void app_task_start(void* pvParameters)
 	
 	xTaskCreate(app_task_adc,   "adc_light", 512, NULL, 5, &app_task_adc_handle);
 	
-//	xTaskCreate(app_task_mpu6050, "mpu",512,NULL,5,&app_task_mpu6050_handle);
+	xTaskCreate(app_task_mpu6050, "mpu",512,NULL,5,&app_task_mpu6050_handle);
 	
     vTaskDelete(NULL);
 }
@@ -251,130 +255,194 @@ static void app_task_start(void* pvParameters)
 /* ================= RTC主任务：时间刷新+闹钟业务处理（核心修复） ================= */
 static void app_task_rtc(void* pvParameters)
 {
-    static uint8_t last_h = 0, last_m = 0;
-    static uint8_t alarm_trig_lock = 0;
-    static uint32_t alarm_light_tick = 0; // 闹钟亮灯计时30s自动熄灭
-    char time_buf[32] = {0};
-    char clear_time[10] = "        ";
+    /* ---------- 时间刷新缓存 ---------- */
+    static uint8_t last_hour = 0xFF;
+    static uint8_t last_min  = 0xFF;
 
+    /* ---------- 闹钟相关 ---------- */
+    static uint8_t alarm_trig_lock = 0;
+    static uint32_t alarm_light_tick = 0;
+
+    /* ---------- RTC 初始化 ---------- */
     rtc_init();
     TFT_clear(WHITE);
+
+    lcd_draw_image(0, 0,
+        g_image_tbl[12].width,
+        g_image_tbl[12].height,
+        g_image_tbl[12].address);
 
     RTC_GetDate(RTC_Format_BCD, &RTC_DateStructure);
     RTC_GetTime(RTC_Format_BCD, &RTC_TimeStructure);
 
+    /* ---------- 首次绘制时间（冒号只画一次） ---------- */
     LCD_SAFE
     (
-        lcd_show_string_fmt(0,60,BLACK,WHITE,80,"%02x:%02x",
-            RTC_TimeStructure.RTC_Hours,
-            RTC_TimeStructure.RTC_Minutes);
-        lcd_show_string(142,8,"100%",BLACK,WHITE,16);
-        lcd_draw_image(180,0,
-            g_image_tbl[13].width,
-            g_image_tbl[13].height,
-            g_image_tbl[13].address);
+        /* 电池/状态栏 */
+        lcd_show_string(142, 8, "100%", BLACK, WHITE, 16);
+        lcd_draw_image(180, 0,
+            g_image_tbl[9].width,
+            g_image_tbl[9].height,
+            g_image_tbl[9].address);
+
+        /* 小时 */
+        lcd_show_string_fmt(0, 60, BLACK, WHITE, 80, "%02d",
+            BcdToDec(RTC_TimeStructure.RTC_Hours));
+
+        /* 冒号（永不刷新） */
+        lcd_show_string(80, 55, ":", BLACK, WHITE, 80);
+
+        /* 分钟 */
+        lcd_show_string_fmt(120, 60, BLACK, WHITE, 80, "%02d",
+            BcdToDec(RTC_TimeStructure.RTC_Minutes));
     );
 
-    last_h = RTC_TimeStructure.RTC_Hours;
-    last_m = RTC_TimeStructure.RTC_Minutes;
+    last_hour = BcdToDec(RTC_TimeStructure.RTC_Hours);
+    last_min  = BcdToDec(RTC_TimeStructure.RTC_Minutes);
+
     Led_Alarm_Off();
 
-    while(1)
+    /* ================================================== */
+    while (1)
     {
-        // 切换UI页面，销毁自身启动UI1
-        if(jump_ui_flag % 2 != 0)
+        /* ---------- UI 切换 ---------- */
+        if (jump_ui_flag % 2 != 0)
         {
             TFT_clear(WHITE);
-            if(app_task_ui1_handle == NULL)
+            if (app_task_ui1_handle == NULL)
                 xTaskCreate(app_task_ui1, "ui1", 512, NULL, 5, &app_task_ui1_handle);
+
             app_task_rtc_handle = NULL;
             vTaskDelete(NULL);
         }
 
-        // RTC刷新标志更新界面
-        if(g_rtc_refresh_flag)
-        {
-            RTC_GetTime(RTC_Format_BCD, &RTC_TimeStructure);
-            RTC_GetDate(RTC_Format_BCD, &RTC_DateStructure);
-            LCD_SAFE
-            (
-                lcd_show_string(0,60,clear_time,WHITE,WHITE,80);
-                sprintf(time_buf,"%02x:%02x",RTC_TimeStructure.RTC_Hours,RTC_TimeStructure.RTC_Minutes);
-                lcd_show_string(0,60,time_buf,BLACK,WHITE,80);
-            );
-            last_h = RTC_TimeStructure.RTC_Hours;
-            last_m = RTC_TimeStructure.RTC_Minutes;
-            g_rtc_refresh_flag = 0;
-        }
+        /* ---------- RTC 刷新标志 ---------- */
+		if (g_rtc_refresh_flag)
+		{
+			RTC_GetTime(RTC_Format_BCD, &RTC_TimeStructure);
+			RTC_GetDate(RTC_Format_BCD, &RTC_DateStructure);
 
-        // RTC秒中断刷新分钟
-        if(g_rtc_wakeup_event)
+			uint8_t hour = BcdToDec(RTC_TimeStructure.RTC_Hours);
+			uint8_t min  = BcdToDec(RTC_TimeStructure.RTC_Minutes);
+
+			/* 强制全刷新（串口校时 / UI 重进） */
+			if (g_rtc_force_full_refresh)
+			{
+				LCD_SAFE
+				(
+					lcd_show_string_fmt(0, 60, BLACK, WHITE, 80, "%02d", hour);
+					lcd_show_string(80, 55, ":", BLACK, WHITE, 80);   // ? 冒号重画
+					lcd_show_string_fmt(120, 60, BLACK, WHITE, 80, "%02d", min);
+				);
+				last_hour = hour;
+				last_min  = min;
+				g_rtc_force_full_refresh = 0;
+			}
+			else
+			{
+				/* 正常局部刷新 */
+				if (hour != last_hour)
+				{
+					LCD_SAFE
+					(
+						lcd_show_string_fmt(0, 60, BLACK, WHITE, 80, "%02d", hour);
+					);
+					last_hour = hour;
+				}
+
+				if (min != last_min)
+				{
+					LCD_SAFE
+					(
+						lcd_show_string_fmt(120, 60, BLACK, WHITE, 80, "%02d", min);
+					);
+					last_min = min;
+				}
+			}
+
+			g_rtc_refresh_flag = 0;
+		}
+
+        /* ---------- 秒中断（仅用于跨分钟/跨小时） ---------- */
+        if (g_rtc_wakeup_event)
         {
             g_rtc_wakeup_event = 0;
             RTC_GetTime(RTC_Format_BCD, &RTC_TimeStructure);
-            if(last_h != RTC_TimeStructure.RTC_Hours || last_m != RTC_TimeStructure.RTC_Minutes)
+
+            uint8_t hour = BcdToDec(RTC_TimeStructure.RTC_Hours);
+            uint8_t min  = BcdToDec(RTC_TimeStructure.RTC_Minutes);
+
+            if (hour != last_hour)
             {
                 LCD_SAFE
                 (
-                    lcd_show_string(0,60,clear_time,WHITE,WHITE,80);
-                    sprintf(time_buf,"%02x:%02x",RTC_TimeStructure.RTC_Hours,RTC_TimeStructure.RTC_Minutes);
-                    lcd_show_string(0,60,time_buf,BLACK,WHITE,80);
+                    lcd_show_string_fmt(0, 60, BLACK, WHITE, 80, "%02d", hour);
                 );
-                last_h = RTC_TimeStructure.RTC_Hours;
-                last_m = RTC_TimeStructure.RTC_Minutes;
+                last_hour = hour;
+            }
+
+            if (min != last_min)
+            {
+                LCD_SAFE
+                (
+                    lcd_show_string_fmt(120, 60, BLACK, WHITE, 80, "%02d", min);
+                );
+                last_min = min;
             }
         }
 
-        // ===================== 闹钟业务处理（修复BCD对比BUG） =====================
+        /* ===================== 闹钟业务 ===================== */
         uint8_t cur_h_dec = BcdToDec(RTC_TimeStructure.RTC_Hours);
         uint8_t cur_m_dec = BcdToDec(RTC_TimeStructure.RTC_Minutes);
         uint8_t cur_s_dec = BcdToDec(RTC_TimeStructure.RTC_Seconds);
         uint8_t hit_alarm = 0;
 
-        // 1. 硬件闹钟中断触发
-        if(g_alarm_int_trig)
-		{
-			g_alarm_int_trig = 0;
-			Led_Alarm_On();
-			alarm_trig_lock = 1;
-			g_alarm_light_on = 1; // 标记闹钟亮屏
-			alarm_light_tick = xTaskGetTickCount();
-		}
+        /* 硬件闹钟中断 */
+        if (g_alarm_int_trig)
+        {
+            g_alarm_int_trig = 0;
+            Led_Alarm_On();
+            alarm_trig_lock = 1;
+            g_alarm_light_on = 1;
+            alarm_light_tick = xTaskGetTickCount();
+        }
 
-        // 2. 软件轮询兜底校验（十进制对比，修复卡死根源）
-        for(uint8_t i=0; i<g_alarm_count; i++)
+        /* 软件轮询兜底 */
+        for (uint8_t i = 0; i < g_alarm_count; i++)
         {
             alarm_info_t *alarm = &g_alarm_list[i];
-            if(alarm->enable == 0) continue;
-            if(alarm->hour == cur_h_dec && alarm->min == cur_m_dec && alarm->sec == cur_s_dec)
+            if (alarm->enable == 0) continue;
+            if (alarm->hour == cur_h_dec &&
+                alarm->min  == cur_m_dec &&
+                alarm->sec  == cur_s_dec)
             {
                 hit_alarm = 1;
                 break;
             }
         }
-        if(hit_alarm && alarm_trig_lock == 0)
-		{
-			Led_Alarm_On();
-			alarm_trig_lock = 1;
-			g_alarm_light_on = 1;
-			alarm_light_tick = xTaskGetTickCount();
-		}
 
-        // 3. 亮灯30s自动熄灭
-		if(alarm_trig_lock && (xTaskGetTickCount() - alarm_light_tick) > pdMS_TO_TICKS(30000))
-		{
-			Led_Alarm_Off();
-			alarm_trig_lock = 0;
-			g_alarm_light_on = 0; // 取消闹钟标记
-		}
+        if (hit_alarm && alarm_trig_lock == 0)
+        {
+            Led_Alarm_On();
+            alarm_trig_lock = 1;
+            g_alarm_light_on = 1;
+            alarm_light_tick = xTaskGetTickCount();
+        }
 
-        // 每分钟解锁闹钟触发锁
-        if(BcdToDec(last_m) != cur_m_dec)
+        /* 闹钟亮灯30s自动关闭 */
+        if (alarm_trig_lock &&
+            (xTaskGetTickCount() - alarm_light_tick) > pdMS_TO_TICKS(30000))
+        {
+            Led_Alarm_Off();
+            alarm_trig_lock = 0;
+            g_alarm_light_on = 0;
+        }
+
+        /* 每分钟解锁闹钟触发锁 */
+        if (BcdToDec(RTC_TimeStructure.RTC_Minutes) != last_min)
         {
             alarm_trig_lock = 0;
-            last_m = RTC_TimeStructure.RTC_Minutes;
         }
-        // ========================================================================
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -388,9 +456,9 @@ static void app_task_ui1(void* pvParameters)
     (
         TFT_clear(WHITE);
         draw_info(20, 10, 0, "日  历");
-        draw_info(20, 73, 6, "闹  钟");
-        draw_info(20, 136, 9, "心  率");
-        draw_info(20, 199, 5, "温湿度");
+        draw_info(20, 73, 3, "闹  钟");
+        draw_info(20, 136, 6, "心  率");
+        draw_info(20, 199, 1, "温湿度");
     );
 
     for(;;)
@@ -472,9 +540,9 @@ static void app_task_ui1(void* pvParameters)
 				(
 					TFT_clear(WHITE);
 					draw_info(20, 10, 0, "日  历");
-					draw_info(20, 73, 6, "闹  钟");
-					draw_info(20, 136, 9, "心  率");
-					draw_info(20, 199, 5, "温湿度");
+					draw_info(20, 73, 3, "闹  钟");
+					draw_info(20, 136, 6, "心  率");
+					draw_info(20, 199, 1, "温湿度");
 				);
 			}
         }
@@ -495,10 +563,10 @@ static void app_task_ui2(void* pvParameters)
     LCD_SAFE
     (
         TFT_clear(WHITE);
-		draw_info(20, 10, 8, "步  数");
-		draw_info(20, 73, 7, "无线设备");
-		draw_info(20, 136, 10, "相  机");
-		draw_info(20, 199, 11, "人脸识别");
+		draw_info(20, 10, 5, "步  数");
+		draw_info(20, 73, 4, "无线设备");
+		draw_info(20, 136, 7, "相  机");
+		draw_info(20, 199, 8, "人脸识别");
     );
 
     for(;;)
@@ -551,10 +619,10 @@ static void app_task_ui2(void* pvParameters)
 				LCD_SAFE
 				(
 					TFT_clear(WHITE);
-					draw_info(20, 10, 8, "步  数");
-					draw_info(20, 73, 7, "无线设备");
-					draw_info(20, 136, 10, "相  机");
-					draw_info(20, 199, 11, "人脸识别");
+					draw_info(20, 10, 5, "步  数");
+					draw_info(20, 73, 4, "无线设备");
+					draw_info(20, 136, 7, "相  机");
+					draw_info(20, 199, 8, "人脸识别");
 				);
 			}
         }
@@ -583,14 +651,6 @@ static void app_task_tp(void* pvParameters)
 		{
 			if(tp_sta != 0)
 			{
-                // 新增：触摸立刻亮屏，清除暗光标记
-				if(g_screen_off_flag == 1)
-				{
-					LCD_SAFE(lcd_display_on(1););
-					g_screen_off_flag = 0;
-					g_dark_start_tick = 0;
-					ulIdleCount = 0; // 重置30s计时器
-				}
 				Led_Alarm_Off(); // 任意触摸熄灭闹钟LED
 				if(press_flag == 0)
 				{
@@ -622,14 +682,6 @@ static void app_task_tp(void* pvParameters)
 		{
 			if(tp_sta != 0)
 			{
-                // 新增：触摸立刻亮屏
-				if(g_screen_off_flag == 1)
-				{
-					LCD_SAFE(lcd_display_on(1););
-					g_screen_off_flag = 0;
-					g_dark_start_tick = 0;
-					ulIdleCount = 0;
-				}
 				Led_Alarm_Off();
 				if(press_flag == 0)
 				{
@@ -703,7 +755,7 @@ static void app_task_dht11(void* pvParameters)
 
 	LCD_SAFE
 	(
-		lcd_draw_image(100,80,g_image_tbl[5].width,g_image_tbl[5].height,g_image_tbl[5].address);
+		lcd_draw_image(100,80,g_image_tbl[1].width,g_image_tbl[1].height,g_image_tbl[1].address);
         lcd_show_string(50,150,"温度:",BLACK,WHITE,32);
         lcd_show_string(50,190,"湿度:",BLACK,WHITE,32);
 	);
@@ -782,9 +834,9 @@ static void app_task_alarm(void* pvParameters)
                         uint16_t cur_y = start_y + i * line_gap;
 
                         lcd_draw_image(20, cur_y,
-                            g_image_tbl[6].width,
-                            g_image_tbl[6].height,
-                            g_image_tbl[6].address);
+                            g_image_tbl[3].width,
+                            g_image_tbl[3].height,
+                            g_image_tbl[3].address);
 
                         lcd_show_string(80, cur_y + 10,clear_line,WHITE, WHITE, 32);
 
@@ -831,7 +883,7 @@ static void app_task_heart(void* pvParameters)
     // ========== 初始化页面，立刻绘制固定文字，加锁 ==========
 	xSemaphoreTake(g_mutex_tft, portMAX_DELAY);
 	TFT_clear(WHITE);
-	lcd_draw_image(100,80,g_image_tbl[9].width,g_image_tbl[9].height,g_image_tbl[9].address);
+	lcd_draw_image(100,80,g_image_tbl[6].width,g_image_tbl[6].height,g_image_tbl[6].address);
     lcd_show_string(50,150,"心率:",BLACK,WHITE,32);
     lcd_show_string(50,190,"血氧:",BLACK,WHITE,32);
 	xSemaphoreGive(g_mutex_tft);
@@ -938,26 +990,52 @@ static void app_task_step(void* pvParameters)
 {
 	uint32_t i=0;
 	char step_buf[32] = {0};
-	unsigned long step_count_last=0;
-	dmp_set_pedometer_step_count(0);
-	LCD_SAFE(lcd_draw_image(100,80,g_image_tbl[8].width,g_image_tbl[8].height,g_image_tbl[8].address););
+	uint32_t step_count_last=0;
+    uint32_t cur_step = 0;
+    // 进入页面强制清零步数缓存，刷新一次界面
+    dmp_set_pedometer_step_count(0);
+    step_count = 0;
+    step_count_last = 0;
+	LCD_SAFE(
+        TFT_clear(WHITE);
+        lcd_draw_image(100,80,g_image_tbl[5].width,g_image_tbl[5].height,g_image_tbl[5].address);
+        lcd_show_string(130,160,"0",BLACK,WHITE,32);
+    );
 
 	for(;;)
 	{
-		dmp_get_pedometer_step_count((unsigned long *)&step_count);
-		sprintf(step_buf,"%lu",(unsigned long)step_count);
-		LCD_SAFE(lcd_show_string(130,160,step_buf,BLACK,WHITE,32););
+        // 屏幕熄灭直接跳过刷新
+        if(g_screen_off_flag == 1)
+        {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // 读取当前步数
+		dmp_get_pedometer_step_count(&cur_step);
+        step_count = cur_step;
+
+        // 步数变化才刷新屏幕
+		if(step_count != step_count_last)
+        {
+		    sprintf(step_buf,"%lu",step_count);
+		    LCD_SAFE(
+                lcd_show_string(130,160,"        ",WHITE,WHITE,32); // 清空旧数字
+                lcd_show_string(130,160,step_buf,BLACK,WHITE,32);
+            );
+            step_count_last = step_count;
+        }
 				
 		i++;
 		if(i>=100)
 		{
-			dmp_get_pedometer_step_count((unsigned long *)&step_count);
-			step_count_last=step_count;
+			dmp_get_pedometer_step_count(&cur_step);
+			step_count_last = cur_step;
 			i=0;
 		}
 		vTaskDelay(pdMS_TO_TICKS(500));
 	}
-}		
+}
 
 static void app_task_wire(void* pvParameters)
 {
@@ -970,7 +1048,7 @@ static void app_task_wire(void* pvParameters)
             LCD_SAFE
             (
                 TFT_clear(WHITE);
-                lcd_draw_image(100,80,g_image_tbl[7].width,g_image_tbl[7].height,g_image_tbl[7].address);
+                lcd_draw_image(100,80,g_image_tbl[4].width,g_image_tbl[4].height,g_image_tbl[4].address);
                 lcd_show_string(50,190,tip_str,BLACK,WHITE,32);
             );
             refresh = 0;
@@ -990,7 +1068,7 @@ static void app_task_camera(void* pvParameters)
             LCD_SAFE
             (
                 TFT_clear(WHITE);
-                lcd_draw_image(100,80,g_image_tbl[10].width,g_image_tbl[10].height,g_image_tbl[10].address);
+                lcd_draw_image(100,80,g_image_tbl[7].width,g_image_tbl[7].height,g_image_tbl[7].address);
                 lcd_show_string(50,190,tip_str,BLACK,WHITE,32);
             );
             refresh = 0;
@@ -1010,7 +1088,7 @@ static void app_task_face(void* pvParameters)
             LCD_SAFE
             (
                 TFT_clear(WHITE);
-                lcd_draw_image(100,80,g_image_tbl[11].width,g_image_tbl[11].height,g_image_tbl[11].address);
+                lcd_draw_image(100,80,g_image_tbl[8].width,g_image_tbl[8].height,g_image_tbl[8].address);
                 lcd_show_string(50,190,tip_str,BLACK,WHITE,32);
             );
             refresh = 0;
@@ -1040,19 +1118,35 @@ static void vTimer_callback(TimerHandle_t pxTimer)
     }
 }
 
-/* ================= MPU6050抬手亮屏（删除冲突IO操作） ================= */
-//static void app_task_mpu6050(void* pvParameters)
-//{
-//	float pitch,roll,yaw;
-//	for(;;)
-//	{
-//		if(mpu_dmp_get_data(&pitch,&roll,&yaw)==0)
-//		{
-//		
-//		}
-//		vTaskDelay(pdMS_TO_TICKS(500));
-//	}
-//}
+/* ================= MPU6050抬手亮屏 + 姿态检测 ================= */
+static void app_task_mpu6050(void* pvParameters)
+{
+	float pitch,roll,yaw; //欧拉角
+
+	for(;;)
+	{
+			if(mpu_dmp_get_data(&pitch,&roll,&yaw)==0)
+			{
+				//抬手亮屏
+				if(roll>=15)
+				{
+					PFout(9)=PFout(10)=0;
+					PEout(13)=PEout(14)=0;
+					//定时器计数值清零
+					ulIdleCount=0;
+					
+					lcd_display_on(1);
+				}
+				if(roll<5)
+				{
+					PFout(9)=PFout(10)=1;
+					PEout(13)=PEout(14)=1;
+				}
+				delay_ms(200);
+			}
+
+	}
+}
 
 /* ================= 串口指令解析（修复BCD写入） ================= */
 static void app_task_usart(void* pvParameters)
@@ -1080,6 +1174,7 @@ static void app_task_usart(void* pvParameters)
 				RTC_SetTime(RTC_Format_BCD, &RTC_TimeStructure);
 				printf("Set Time OK: %02d:%02d:%02d\r\n",hours,minutes,seconds);	
 				g_rtc_refresh_flag = 1;
+				g_rtc_force_full_refresh = 1;
 			}
 			// 设置日期 DATE SET-YEAR-MON-DAY-WEEK#
 			if(strstr((const char*)msg.buf,"DATE SET"))
@@ -1107,19 +1202,39 @@ static void app_task_usart(void* pvParameters)
 				p=strtok(NULL,"-");if(!p)continue; minutes=atoi(p);
 				p=strtok(NULL,"-");if(!p)continue; seconds=atoi(p);
 
-				if(g_alarm_count < MAX_ALARM_NUM)
+				/* ===== 闹钟去重 ===== */
+				uint8_t already_exist = 0;
+				for (uint8_t i = 0; i < g_alarm_count; i++)
 				{
-					g_alarm_list[g_alarm_count].hour = hours;
-					g_alarm_list[g_alarm_count].min = minutes;
-					g_alarm_list[g_alarm_count].sec = seconds;
+					if (g_alarm_list[i].enable == 0) continue;
+					if (g_alarm_list[i].hour == hours &&
+						g_alarm_list[i].enable == 1 &&
+						g_alarm_list[i].min  == minutes &&
+						g_alarm_list[i].sec  == seconds)
+					{
+						already_exist = 1;
+						break;
+					}
+				}
+
+				if (already_exist)
+				{
+					printf("Alarm already exists, ignore\r\n");
+				}
+				else if (g_alarm_count < MAX_ALARM_NUM)
+				{
+					g_alarm_list[g_alarm_count].hour   = hours;
+					g_alarm_list[g_alarm_count].min    = minutes;
+					g_alarm_list[g_alarm_count].sec    = seconds;
 					g_alarm_list[g_alarm_count].enable = 1;
 					g_alarm_count++;
+
+					printf("Add Alarm OK %02d:%02d:%02d, total:%d\r\n",
+						   hours, minutes, seconds, g_alarm_count);
 				}
 				else
 				{
-					printf("Alarm list full, max %d\r\n",MAX_ALARM_NUM);
-					memset(msg.buf,0,sizeof(msg.buf));
-					continue;
+					printf("Alarm list full, max %d\r\n", MAX_ALARM_NUM);
 				}
 				
 				RTC_AlarmStructure.RTC_AlarmTime.RTC_Hours   = DecToBcd(hours);

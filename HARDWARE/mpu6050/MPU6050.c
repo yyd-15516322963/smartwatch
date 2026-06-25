@@ -21,12 +21,13 @@ u8 MPU_Init(void)
 	MPU_Write_Byte(MPU_INTBP_CFG_REG,0X80);	//INT引脚低电平有效
 	res=MPU_Read_Byte(MPU_DEVICE_ID_REG);
 	printf("RES=%X\r\n",res);
-	if(res==MPU_ADDR)//器件ID正确
+	// 兼容0x68 / 0x70两种芯片ID
+	if(res == 0x68 || res == 0x70)
 	{
-		MPU_Write_Byte(MPU_PWR_MGMT1_REG,0X01);	//设置CLKSEL,PLL X轴为参考
-		MPU_Write_Byte(MPU_PWR_MGMT2_REG,0X00);	//加速度与陀螺仪都工作
-		MPU_Set_Rate(50);						//设置采样率为50Hz
- 	}else return 1;
+		MPU_Write_Byte(MPU_PWR_MGMT1_REG,0X01);
+		MPU_Write_Byte(MPU_PWR_MGMT2_REG,0X00);
+		MPU_Set_Rate(50);
+	}else return 1;
 	return 0;
 }
 //设置MPU6050陀螺仪传感器满量程范围
